@@ -41,15 +41,21 @@ def load_csv_raw(lang, force=False):
     if not force and lang in CACHE["csv"] and now - CACHE["ts"].get(lang, 0) < CACHE_TTL_SECONDS:
         return CACHE["csv"][lang]
     url = BASE_SHEET_URL + TAB_GIDS[lang]
-    resp = requests.get(url, timeout=10)
-    resp.raise_for_status()
-    data = resp.content.decode("utf-8", errors="ignore")
-    CACHE["csv"][lang] = data
-    CACHE["ts"][lang] = now
-    return data
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.content.decode("utf-8", errors="ignore")
+        CACHE["csv"][lang] = data
+        CACHE["ts"][lang] = now
+        return data
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch Google Sheet for {lang}: {e}")
+        return None  # fail safe
 
 def parse_rows(lang, force=False):
     data = load_csv_raw(lang, force=force)
+    if data is None:
+        return None, []
     reader = csv.reader(io.StringIO(data))
     rows = list(reader)
     headers = [h.strip() for h in rows[0]]
@@ -77,6 +83,8 @@ def parse_rows(lang, force=False):
 
 def build_ordered_vocab(lang, force=False):
     rows, _ = parse_rows(lang, force=force)
+    if rows is None:
+        return None
     def word_key(r):
         try:
             return int(r["word_num"])
@@ -95,6 +103,8 @@ def build_ordered_vocab(lang, force=False):
 
 def get_allowed_up_to(lang, cap=None, force=False):
     words = CACHE["words_ordered"].get(lang) or build_ordered_vocab(lang, force=force)
+    if words is None:
+        return None, None
     if cap is None:
         return words, len(words) - 1
     if isinstance(cap, int):
@@ -116,8 +126,10 @@ def refresh_vocabulary():
     lang = data.get("lang", "").lower()
     if lang not in TAB_GIDS:
         return jsonify(error="Invalid or missing language (use 'es' or 'fr')"), 400
-    parse_rows(lang, force=True)
-    build_ordered_vocab(lang, force=True)
+    if parse_rows(lang, force=True)[0] is None:
+        return jsonify(error="Could not fetch Google Sheet"), 500
+    if build_ordered_vocab(lang, force=True) is None:
+        return jsonify(error="Could not build vocabulary"), 500
     return jsonify(refreshed=True, size=len(CACHE["words_ordered"][lang])), 200
 
 @app.post("/getGenerationState")
@@ -125,16 +137,18 @@ def get_generation_state():
     data = request.get_json(silent=True) or {}
     lang = data.get("lang", "").lower()
     if lang not in TAB_GIDS:
-        return jsonify(error="Invalid or missing language (use 'es' or 'fr')"), 400
+        return jsonify(valid=False, reason="Invalid or missing language (use 'es' or 'fr')"), 400
 
-    topic = (data.get("topic") or "").strip()
     cap = data.get("cap", None)
-    max_targets = int(data.get("max_targets", 5))
 
     allowed, idx = get_allowed_up_to(lang, cap)
+    if allowed is None:
+        return jsonify(valid=False, reason="Could not fetch allowed words — Google Sheet unavailable."), 200
+
     topics_hist = sorted(set(r["topic"] for r in CACHE["rows"].get(lang, []) if r["topic"]))
     prior = [s for r in CACHE["rows"].get(lang, []) for s in r["sentences"] if s]
     return jsonify(
+        valid=True,
         allowed_vocabulary=allowed,
         learned_upto_index=idx,
         topics_history=topics_hist,
@@ -146,11 +160,16 @@ def validate():
     data = request.get_json(silent=True) or {}
     lang = data.get("lang", "").lower()
     if lang not in TAB_GIDS:
-        return jsonify(error="Invalid or missing language (use 'es' or 'fr')"), 400
+        return jsonify(valid=False, reason="Invalid or missing language (use 'es' or 'fr')"), 400
 
     sentence = (data.get('sentence') or '').strip()
     if not sentence:
-        return jsonify(valid=False, reason="Empty sentence")
+        return jsonify(valid=False, reason="Empty sentence"), 200
+
+    words = build_ordered_vocab(lang)
+    if words is None:
+        return jsonify(valid=False, reason="Could not fetch allowed words — Google Sheet unavailable."), 200
+
     return jsonify(valid=True)
 
 if __name__ == "__main__":
