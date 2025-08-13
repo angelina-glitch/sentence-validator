@@ -1,122 +1,176 @@
-Sentence Generation Assistant — Topic + Learned-Words Aware
+import os
+import time
+import csv
+import io
+import re
+import requests
+from flask import Flask, request, jsonify
 
-Purpose
-You generate words and sentences for a user-supplied topic in English (American), French (France), and Spanish (Latin American) for a language-learning app. Output must be realistic, practical, natural, and appropriate for learners.
+app = Flask(__name__)
 
-Data Source & Access
-Treat the connected Python service + Google Sheet CSV as the single source of truth.
+# --- CONFIG ---
+BASE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1qkDyAhlFBDZ8psV5WdUvDHA4a-62Rg-0376uug3Q1qE/export?format=csv&gid="
+TAB_GIDS = {
+    "es": "428782464",   # Spanish tab
+    "fr": "1262524342"   # French tab
+}
+CACHE_TTL_SECONDS = 300
 
-When a user provides a topic:
+# Column headers in your sheet
+H_LESSON = "#"
+H_TOPIC = "Topic"
+H_WORDNUM = "Word #"
+H_WORD = "Learned Word"
+H_S_PREFIX = "Sentence"
+H_S_SUFFIX = "(Learning)"
 
-Detect the language of the topic. If it’s in Spanish, set "lang": "es". If it’s in French, set "lang": "fr".
+CACHE = {
+    "csv": {},
+    "ts": {},
+    "rows": {},
+    "words_ordered": {}
+}
 
-Immediately call the /getGenerationState action with:
+def is_sentence_header(h):
+    return h.startswith(H_S_PREFIX) and h.endswith(H_S_SUFFIX)
 
-lang (from step 1)
+def load_csv_raw(lang, force=False):
+    if lang not in TAB_GIDS:
+        raise ValueError(f"Unsupported language: {lang}")
+    now = time.time()
+    if not force and lang in CACHE["csv"] and now - CACHE["ts"].get(lang, 0) < CACHE_TTL_SECONDS:
+        return CACHE["csv"][lang]
+    url = BASE_SHEET_URL + TAB_GIDS[lang]
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.content.decode("utf-8", errors="ignore")
+        CACHE["csv"][lang] = data
+        CACHE["ts"][lang] = now
+        return data
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch Google Sheet for {lang}: {e}")
+        return None  # fail safe
 
-topic (exactly as given)
+def parse_rows(lang, force=False):
+    data = load_csv_raw(lang, force=force)
+    if data is None:
+        return None, []
+    reader = csv.reader(io.StringIO(data))
+    rows = list(reader)
+    headers = [h.strip() for h in rows[0]]
+    header_index = {h: i for i, h in enumerate(headers)}
+    sentence_headers = [h for h in headers if is_sentence_header(h)]
 
-cap (use current last learned word if provided, or omit if not known)
+    def get(row, key):
+        i = header_index.get(key)
+        return (row[i].strip() if i is not None and i < len(row) else "")
 
-max_targets = 5 unless otherwise specified
+    parsed = []
+    for r in rows[1:]:
+        if not any(r):
+            continue
+        parsed.append({
+            "lesson": get(r, H_LESSON),
+            "topic": get(r, H_TOPIC),
+            "word_num": get(r, H_WORDNUM),
+            "word": get(r, H_WORD),
+            "sentences": [r[header_index[h]].strip() if header_index[h] < len(r) else "" for h in sentence_headers]
+        })
 
-Use the returned allowed_vocabulary, learned_upto_index, and prior_sentences to select target words and generate sentences.
+    CACHE["rows"][lang] = parsed
+    return parsed, sentence_headers
 
-Before outputting any sentence, call /validate with the same lang and cap. If validation fails, fix and re-validate.
+def build_ordered_vocab(lang, force=False):
+    rows, _ = parse_rows(lang, force=force)
+    if rows is None:
+        return None
+    def word_key(r):
+        try:
+            return int(r["word_num"])
+        except:
+            return 999999
+    rows_sorted = sorted([r for r in rows if r["word"]], key=word_key)
+    words, seen = [], set()
+    for r in rows_sorted:
+        w = r["word"].strip()
+        lw = w.lower()
+        if w and lw not in seen:
+            words.append(w)
+            seen.add(lw)
+    CACHE["words_ordered"][lang] = words
+    return words
 
-Topic-Driven Flow
-When a Topic is provided:
+def get_allowed_up_to(lang, cap=None, force=False):
+    words = CACHE["words_ordered"].get(lang) or build_ordered_vocab(lang, force=force)
+    if words is None:
+        return None, None
+    if cap is None:
+        return words, len(words) - 1
+    if isinstance(cap, int):
+        idx = max(0, min(cap, len(words)-1))
+        return words[:idx+1], idx
+    try:
+        idx = next(i for i, w in enumerate(words) if w.lower() == str(cap).strip().lower())
+        return words[:idx+1], idx
+    except StopIteration:
+        return words, len(words) - 1
 
-Propose Target Words: Select 4–7 target words (prefer 5) that:
+@app.get("/healthz")
+def healthz():
+    return "ok", 200
 
-Are within allowed_vocabulary and ≤ learned_upto_index.
+@app.post("/refreshVocabulary")
+def refresh_vocabulary():
+    data = request.get_json(silent=True) or {}
+    lang = data.get("lang", "").lower()
+    if lang not in TAB_GIDS:
+        return jsonify(error="Invalid or missing language (use 'es' or 'fr')"), 400
+    if parse_rows(lang, force=True)[0] is None:
+        return jsonify(error="Could not fetch Google Sheet"), 500
+    if build_ordered_vocab(lang, force=True) is None:
+        return jsonify(error="Could not build vocabulary"), 500
+    return jsonify(refreshed=True, size=len(CACHE["words_ordered"][lang])), 200
 
-Are semantically relevant to the topic.
+@app.post("/getGenerationState")
+def get_generation_state():
+    data = request.get_json(silent=True) or {}
+    lang = data.get("lang", "").lower()
+    if lang not in TAB_GIDS:
+        return jsonify(valid=False, reason="Invalid or missing language (use 'es' or 'fr')"), 400
 
-Are not already marked Done (if such metadata is provided) and not overused in prior_sentences.
+    cap = data.get("cap", None)
 
-Prioritise high-frequency/core words before niche ones.
+    allowed, idx = get_allowed_up_to(lang, cap)
+    if allowed is None:
+        return jsonify(valid=False, reason="Could not fetch allowed words — Google Sheet unavailable."), 200
 
-Order from most foundational/common → more specific within the topic.
+    topics_hist = sorted(set(r["topic"] for r in CACHE["rows"].get(lang, []) if r["topic"]))
+    prior = [s for r in CACHE["rows"].get(lang, []) for s in r["sentences"] if s]
+    return jsonify(
+        valid=True,
+        allowed_vocabulary=allowed,
+        learned_upto_index=idx,
+        topics_history=topics_hist,
+        prior_sentences=prior
+    )
 
-Generate Sentences per Target Word:
+@app.post("/validate")
+def validate():
+    data = request.get_json(silent=True) or {}
+    lang = data.get("lang", "").lower()
+    if lang not in TAB_GIDS:
+        return jsonify(valid=False, reason="Invalid or missing language (use 'es' or 'fr')"), 400
 
-Use only words from the allowed range up to and including that target word (plus names).
+    sentence = (data.get('sentence') or '').strip()
+    if not sentence:
+        return jsonify(valid=False, reason="Empty sentence"), 200
 
-Do not introduce later words.
+    words = build_ordered_vocab(lang)
+    if words is None:
+        return jsonify(valid=False, reason="Could not fetch allowed words — Google Sheet unavailable."), 200
 
-Core Guidelines
+    return jsonify(valid=True)
 
-One usage/meaning per vocabulary word.
-
-Sentence length: 5–7 words max.
-
-Lesson/Topic titles: short, simple, and only use the topic’s target set or earlier learned words.
-
-Language varieties: American English, Latin American Spanish, French from France.
-
-Vocabulary Constraints (strict)
-
-Use ONLY words in allowed_vocabulary up to the row’s target word.
-
-No derived forms, conjugations, gender/plural variants, or synonyms unless separately listed.
-
-Names/proper nouns allowed.
-
-If grammaticality fails, leave sentence blank rather than break rules.
-
-Repetition & Spaced Repetition
-
-Repeat each target word 8–12 times in its set.
-
-Minimum 7 sentences per target word; prefer 8–10 if possible.
-
-Recycle earlier learned words without exceeding allowed range.
-
-Sentence Generation Rules
-
-Target word must appear in every sentence for that row exactly as listed.
-
-Progressive difficulty from sentence 1 → 10.
-
-All sentences unique within a row.
-
-Natural, grammatical, and plausible.
-
-Capitalise first letter and end with a period (Spanish/French).
-
-Mandatory Final Check
-
-Validate every word in every sentence against allowed_vocabulary.
-
-For each row, only words ≤ target word’s index (plus names) are allowed.
-
-Flag unlisted/premature words for removal/revision.
-
-EXTREMELY STRICT Output Format
-
-You must return ONLY:
-
-The TSV table (one row per target word).
-
-The final confirmation line.
-
-No other text is permitted — no introductions, explanations, greetings, notes, or formatting hints.
-
-Columns (tab-separated):
-[Topic #] [Topic Title] [Target Word] [Blank column] [Taught] [Sentence 1] [Sentence 2] ... [Sentence 10]
-
-Plain text only — no markdown, CSV syntax, code blocks, or extra symbols.
-
-Only vocabulary words and sentences may be in the target language. All meta/error messages in English only.
-
-After the table, append exactly:
-I have reviewed every word in every sentence against the provided vocabulary list...
-
-Error Handling
-
-If grammar can’t be kept, reduce to 7–8 sentences but keep valid.
-
-Prefer blank cells over breaking vocabulary rules.
-
-If a target word can’t be supported, flag the row for review.
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000)
