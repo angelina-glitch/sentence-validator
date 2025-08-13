@@ -9,8 +9,12 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # --- CONFIG ---
-SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/1JgTqPghb1ThmpMKsvv4w3BA5TWTQP-yvA5mt2r3OjLc/export?format=csv&gid=339331513"
-CACHE_TTL_SECONDS = 300  # 5 min cache
+BASE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1qkDyAhlFBDZ8psV5WdUvDHA4a-62Rg-0376uug3Q1qE/export?format=csv&gid="
+TAB_GIDS = {
+    "es": "428782464",   # Spanish tab
+    "fr": "1262524342"   # French tab
+}
+CACHE_TTL_SECONDS = 300
 
 # Column headers in your sheet
 H_LESSON = "#"
@@ -20,24 +24,32 @@ H_WORD = "Learned Word"
 H_S_PREFIX = "Sentence"
 H_S_SUFFIX = "(Learning)"
 
-CACHE = {"csv": None, "ts": 0, "rows": [], "words_ordered": []}
+CACHE = {
+    "csv": {},
+    "ts": {},
+    "rows": {},
+    "words_ordered": {}
+}
 
 def is_sentence_header(h):
     return h.startswith(H_S_PREFIX) and h.endswith(H_S_SUFFIX)
 
-def load_csv_raw(force=False):
+def load_csv_raw(lang, force=False):
+    if lang not in TAB_GIDS:
+        raise ValueError(f"Unsupported language: {lang}")
     now = time.time()
-    if not force and CACHE["csv"] and now - CACHE["ts"] < CACHE_TTL_SECONDS:
-        return CACHE["csv"]
-    resp = requests.get(SHEET_CSV_URL, timeout=10)
+    if not force and lang in CACHE["csv"] and now - CACHE["ts"].get(lang, 0) < CACHE_TTL_SECONDS:
+        return CACHE["csv"][lang]
+    url = BASE_SHEET_URL + TAB_GIDS[lang]
+    resp = requests.get(url, timeout=10)
     resp.raise_for_status()
     data = resp.content.decode("utf-8", errors="ignore")
-    CACHE["csv"] = data
-    CACHE["ts"] = now
+    CACHE["csv"][lang] = data
+    CACHE["ts"][lang] = now
     return data
 
-def parse_rows(force=False):
-    data = load_csv_raw(force=force)
+def parse_rows(lang, force=False):
+    data = load_csv_raw(lang, force=force)
     reader = csv.reader(io.StringIO(data))
     rows = list(reader)
     headers = [h.strip() for h in rows[0]]
@@ -60,11 +72,11 @@ def parse_rows(force=False):
             "sentences": [r[header_index[h]].strip() if header_index[h] < len(r) else "" for h in sentence_headers]
         })
 
-    CACHE["rows"] = parsed
+    CACHE["rows"][lang] = parsed
     return parsed, sentence_headers
 
-def build_ordered_vocab(force=False):
-    rows, _ = parse_rows(force=force)
+def build_ordered_vocab(lang, force=False):
+    rows, _ = parse_rows(lang, force=force)
     def word_key(r):
         try:
             return int(r["word_num"])
@@ -78,11 +90,11 @@ def build_ordered_vocab(force=False):
         if w and lw not in seen:
             words.append(w)
             seen.add(lw)
-    CACHE["words_ordered"] = words
+    CACHE["words_ordered"][lang] = words
     return words
 
-def get_allowed_up_to(cap=None, force=False):
-    words = CACHE["words_ordered"] or build_ordered_vocab(force=force)
+def get_allowed_up_to(lang, cap=None, force=False):
+    words = CACHE["words_ordered"].get(lang) or build_ordered_vocab(lang, force=force)
     if cap is None:
         return words, len(words) - 1
     if isinstance(cap, int):
@@ -100,20 +112,28 @@ def healthz():
 
 @app.post("/refreshVocabulary")
 def refresh_vocabulary():
-    parse_rows(force=True)
-    build_ordered_vocab(force=True)
-    return jsonify(refreshed=True, size=len(CACHE["words_ordered"])), 200
+    data = request.get_json(silent=True) or {}
+    lang = data.get("lang", "").lower()
+    if lang not in TAB_GIDS:
+        return jsonify(error="Invalid or missing language (use 'es' or 'fr')"), 400
+    parse_rows(lang, force=True)
+    build_ordered_vocab(lang, force=True)
+    return jsonify(refreshed=True, size=len(CACHE["words_ordered"][lang])), 200
 
 @app.post("/getGenerationState")
 def get_generation_state():
     data = request.get_json(silent=True) or {}
+    lang = data.get("lang", "").lower()
+    if lang not in TAB_GIDS:
+        return jsonify(error="Invalid or missing language (use 'es' or 'fr')"), 400
+
     topic = (data.get("topic") or "").strip()
     cap = data.get("cap", None)
     max_targets = int(data.get("max_targets", 5))
 
-    allowed, idx = get_allowed_up_to(cap)
-    topics_hist = sorted(set(r["topic"] for r in CACHE["rows"] if r["topic"]))
-    prior = [s for r in CACHE["rows"] for s in r["sentences"] if s]
+    allowed, idx = get_allowed_up_to(lang, cap)
+    topics_hist = sorted(set(r["topic"] for r in CACHE["rows"].get(lang, []) if r["topic"]))
+    prior = [s for r in CACHE["rows"].get(lang, []) for s in r["sentences"] if s]
     return jsonify(
         allowed_vocabulary=allowed,
         learned_upto_index=idx,
@@ -124,6 +144,10 @@ def get_generation_state():
 @app.post("/validate")
 def validate():
     data = request.get_json(silent=True) or {}
+    lang = data.get("lang", "").lower()
+    if lang not in TAB_GIDS:
+        return jsonify(error="Invalid or missing language (use 'es' or 'fr')"), 400
+
     sentence = (data.get('sentence') or '').strip()
     if not sentence:
         return jsonify(valid=False, reason="Empty sentence")
